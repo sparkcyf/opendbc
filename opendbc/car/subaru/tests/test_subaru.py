@@ -21,7 +21,8 @@ class TestSubaruAnglePlatform(unittest.TestCase):
 
     self.assertFalse(outback.dashcamOnly)
     self.assertEqual(outback.steerControlType, CarParams.SteerControlType.angle)
-    self.assertEqual(outback.safetyConfigs[0].safetyParam, SubaruSafetyFlags.GEN2 | SubaruSafetyFlags.LKAS_ANGLE)
+    self.assertEqual(outback.safetyConfigs[0].safetyParam,
+                     SubaruSafetyFlags.GEN2 | SubaruSafetyFlags.LKAS_ANGLE | SubaruSafetyFlags.LKAS_TOGGLE)
     self.assertFalse(outback.alphaLongitudinalAvailable)
     self.assertFalse(outback.openpilotLongitudinalControl)
 

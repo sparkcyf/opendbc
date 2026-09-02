@@ -62,8 +62,14 @@
   {.msg = {{MSG_SUBARU_ES_Status,       alt_bus,         8, 20U, .max_counter = 15U, .ignore_quality_flag = true}, { 0 }, { 0 }}},  \
   {.msg = {{MSG_SUBARU_Steering_2,      SUBARU_MAIN_BUS, 8, 50U, .max_counter = 15U, .ignore_quality_flag = true}, { 0 }, { 0 }}},  \
 
+#define SUBARU_LKAS_TOGGLE_RX_CHECKS                                                                                                            \
+  {.msg = {{MSG_SUBARU_ES_LKAS_State,   SUBARU_CAM_BUS,  8, 10U, .max_counter = 15U, .ignore_quality_flag = true}, { 0 }, { 0 }}},  \
+
 static bool subaru_gen2 = false;
 static bool subaru_lkas_angle = false;
+static bool subaru_lkas_toggle = false;
+static bool subaru_acc_engaged = false;
+static bool subaru_lkas_enabled = false;
 
 static uint32_t subaru_get_checksum(const CANPacket_t *msg) {
   return (uint8_t)msg->data[0];
@@ -102,8 +108,14 @@ static void subaru_rx_hook(const CANPacket_t *msg) {
   // Enter controls on rising edge of ACC and exit on ACC off. Angle cars use the EyeSight status message;
   // ES_Brake's engagement bit can remain set after pressing the brake at standstill.
   if (subaru_lkas_angle && (msg->addr == MSG_SUBARU_ES_Status) && (msg->bus == alt_main_bus)) {
-    bool cruise_engaged = (msg->data[3] >> 5) & 1U;
+    subaru_acc_engaged = (msg->data[3] >> 5) & 1U;
+    bool cruise_engaged = subaru_acc_engaged && (!subaru_lkas_toggle || subaru_lkas_enabled);
     pcm_cruise_check(cruise_engaged);
+  }
+  if (subaru_lkas_toggle && (msg->addr == MSG_SUBARU_ES_LKAS_State) && (msg->bus == SUBARU_CAM_BUS)) {
+    const unsigned int lkas_dash_state = (msg->data[2] >> 2) & 0x3U;
+    subaru_lkas_enabled = lkas_dash_state != 0U;
+    pcm_cruise_check(subaru_acc_engaged && subaru_lkas_enabled);
   }
   if (!subaru_lkas_angle && (msg->addr == MSG_SUBARU_CruiseControl) && (msg->bus == alt_main_bus)) {
     bool cruise_engaged = (msg->data[5] >> 1) & 1U;
@@ -221,23 +233,36 @@ static safety_config subaru_init(uint16_t param) {
 
   const uint16_t SUBARU_PARAM_GEN2 = 1;
   const uint16_t SUBARU_PARAM_LKAS_ANGLE = 8;
+  const uint16_t SUBARU_PARAM_LKAS_TOGGLE = 16;
 
   subaru_gen2 = GET_FLAG(param, SUBARU_PARAM_GEN2);
   subaru_lkas_angle = GET_FLAG(param, SUBARU_PARAM_LKAS_ANGLE);
+  subaru_lkas_toggle = subaru_gen2 && subaru_lkas_angle && GET_FLAG(param, SUBARU_PARAM_LKAS_TOGGLE);
+  subaru_acc_engaged = false;
+  subaru_lkas_enabled = false;
 
   // TODO: re-enable once more work is done on the limits
   // revert this in the PR that re-enables Subaru longitudinal: https://github.com/commaai/opendbc/pull/3689
 
   safety_config ret;
   if (subaru_lkas_angle) {
-    static RxCheck subaru_lkas_angle_rx_checks[] = {
-      SUBARU_LKAS_ANGLE_RX_CHECKS(SUBARU_MAIN_BUS)
-    };
-    static RxCheck subaru_lkas_angle_gen2_rx_checks[] = {
-      SUBARU_LKAS_ANGLE_RX_CHECKS(SUBARU_ALT_BUS)
-    };
-    ret = subaru_gen2 ? BUILD_SAFETY_CFG(subaru_lkas_angle_gen2_rx_checks, SUBARU_LKAS_ANGLE_GEN2_TX_MSGS) : \
-                        BUILD_SAFETY_CFG(subaru_lkas_angle_rx_checks, SUBARU_LKAS_ANGLE_TX_MSGS);
+    if (subaru_lkas_toggle) {
+      static RxCheck subaru_lkas_angle_toggle_gen2_rx_checks[] = {
+        SUBARU_LKAS_ANGLE_RX_CHECKS(SUBARU_ALT_BUS)
+        SUBARU_LKAS_TOGGLE_RX_CHECKS
+      };
+      ret = BUILD_SAFETY_CFG(subaru_lkas_angle_toggle_gen2_rx_checks, SUBARU_LKAS_ANGLE_GEN2_TX_MSGS);
+    } else if (subaru_gen2) {
+      static RxCheck subaru_lkas_angle_gen2_rx_checks[] = {
+        SUBARU_LKAS_ANGLE_RX_CHECKS(SUBARU_ALT_BUS)
+      };
+      ret = BUILD_SAFETY_CFG(subaru_lkas_angle_gen2_rx_checks, SUBARU_LKAS_ANGLE_GEN2_TX_MSGS);
+    } else {
+      static RxCheck subaru_lkas_angle_rx_checks[] = {
+        SUBARU_LKAS_ANGLE_RX_CHECKS(SUBARU_MAIN_BUS)
+      };
+      ret = BUILD_SAFETY_CFG(subaru_lkas_angle_rx_checks, SUBARU_LKAS_ANGLE_TX_MSGS);
+    }
   } else if (subaru_gen2) {
     static RxCheck subaru_gen2_rx_checks[] = {
       SUBARU_COMMON_RX_CHECKS(SUBARU_ALT_BUS)

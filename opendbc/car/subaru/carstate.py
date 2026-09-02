@@ -3,7 +3,7 @@ from opendbc.can import CANDefine, CANParser
 from opendbc.car import Bus, structs
 from opendbc.car.common.conversions import Conversions as CV
 from opendbc.car.interfaces import CarStateBase
-from opendbc.car.subaru.values import DBC, CanBus, SubaruFlags
+from opendbc.car.subaru.values import CAR, DBC, CanBus, SubaruFlags
 from opendbc.car import CanSignalRateCalculator
 
 
@@ -86,7 +86,13 @@ class CarState(CarStateBase):
     if self.CP.flags & SubaruFlags.LKAS_ANGLE:
       # ES_Brake->Cruise_Activated can stay high after pressing the brake at standstill. ES_Status carries
       # the actual ACC engaged state on angle-LKAS cars and is present on the Gen2 alternate bus.
-      ret.cruiseState.enabled = cp_es_brake.vl["ES_Status"]['Cruise_Activated'] != 0
+      acc_enabled = cp_es_brake.vl["ES_Status"]['Cruise_Activated'] != 0
+      if self.CP.carFingerprint == CAR.SUBARU_OUTBACK_2023:
+        # Preserve the stock ACC-only mode: the EyeSight LKAS button independently gates openpilot lateral.
+        lkas_enabled = cp_cam.vl["ES_LKAS_State"]["LKAS_Dash_State"] != 0
+        ret.cruiseState.enabled = acc_enabled and lkas_enabled
+      else:
+        ret.cruiseState.enabled = acc_enabled
       ret.cruiseState.available = cp_cam.vl["ES_DashStatus"]['Cruise_On'] != 0
     elif self.CP.flags & SubaruFlags.HYBRID:
       # ES_Status is missing on hybrid, so use ES_Brake instead.

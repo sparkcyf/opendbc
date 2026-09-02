@@ -268,5 +268,52 @@ class TestSubaruGen2AngleStockLongitudinalSafety(TestSubaruStockLongitudinalSafe
   FWD_BLACKLISTED_ADDRS = fwd_blacklisted_addr(SubaruMsg.ES_LKAS_ANGLE)
 
 
+class TestSubaruGen2AngleLkasToggleSafety(TestSubaruGen2AngleStockLongitudinalSafety):
+  FLAGS = SubaruSafetyFlags.GEN2 | SubaruSafetyFlags.LKAS_ANGLE | SubaruSafetyFlags.LKAS_TOGGLE
+
+  def setUp(self):
+    super().setUp()
+    self.cnt_lkas_state = 0
+    self._rx(self._lkas_state_msg(1))
+
+  def _lkas_state_msg(self, dash_state):
+    values = {"COUNTER": self.cnt_lkas_state, "LKAS_Dash_State": dash_state}
+    self.cnt_lkas_state = (self.cnt_lkas_state + 1) % 16
+    return self.packer.make_can_msg_safety("ES_LKAS_State", SUBARU_CAM_BUS, values)
+
+  def test_lkas_toggle_gates_controls_allowed(self):
+    self._rx(self._pcm_status_msg(True))
+    self.assertTrue(self.safety.get_controls_allowed())
+
+    self._rx(self._lkas_state_msg(0))
+    self.assertFalse(self.safety.get_controls_allowed())
+
+    # Both Ready and Active are enabled states. Switching between them must not disengage.
+    for dash_state in (1, 2, 1):
+      self._rx(self._lkas_state_msg(dash_state))
+      self.assertTrue(self.safety.get_controls_allowed())
+
+    self._rx(self._pcm_status_msg(False))
+    self.assertFalse(self.safety.get_controls_allowed())
+
+  def test_lkas_cannot_enable_without_acc(self):
+    self._rx(self._pcm_status_msg(False))
+    for dash_state in (0, 1, 2):
+      self._rx(self._lkas_state_msg(dash_state))
+      self.assertFalse(self.safety.get_controls_allowed())
+
+  def test_lkas_toggle_gates_angle_command(self):
+    self._reset_speed_measurement(15)
+    self._reset_angle_measurement(0)
+    self._rx(self._pcm_status_msg(True))
+
+    self._rx(self._lkas_state_msg(0))
+    self.assertFalse(self._tx(self._angle_cmd_msg(0, True)))
+
+    self._rx(self._lkas_state_msg(1))
+    self.safety.set_desired_angle_last(0)
+    self.assertTrue(self._tx(self._angle_cmd_msg(0, True)))
+
+
 if __name__ == "__main__":
   unittest.main()
