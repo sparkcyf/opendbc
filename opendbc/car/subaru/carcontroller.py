@@ -1,7 +1,8 @@
 import numpy as np
 from opendbc.can import CANPacker
-from opendbc.car import Bus, make_tester_present_msg
-from opendbc.car.lateral import (apply_center_deadzone, apply_driver_steer_torque_limits, apply_steer_angle_limits_vm,
+from opendbc.car import Bus, DT_CTRL, make_tester_present_msg
+from opendbc.car.common.filter_simple import FirstOrderFilter
+from opendbc.car.lateral import (apply_driver_steer_torque_limits, apply_steer_angle_limits_vm,
                                  common_fault_avoidance, get_max_angle_vm)
 from opendbc.car.interfaces import CarControllerBase
 from opendbc.car.subaru import subarucan
@@ -32,6 +33,7 @@ class CarController(CarControllerBase):
     self.steer_rate_counter = 0
 
     self.p = CarControllerParams(CP)
+    self.angle_filter = FirstOrderFilter(0.0, 0.1, DT_CTRL * self.p.STEER_STEP)
     self.packer = CANPacker(DBC[CP.carFingerprint][Bus.pt])
     self.VM = VehicleModel(get_safety_cp()) if CP.flags & SubaruFlags.LKAS_ANGLE else None
 
@@ -49,14 +51,17 @@ class CarController(CarControllerBase):
     lat_active = lat_active and abs(self.apply_angle_last) <= max_angle
 
     apply_angle = CC.actuators.steeringAngleDeg
-    # The source Crosstrek oscillated at low speeds. Keep its conservative speed-dependent deadzone
-    # for the first Outback tests, then tune or remove it using Outback data.
-    if lat_active and CS.out.vEgoRaw < 10.0:
-      deadzone = np.interp(CS.out.vEgoRaw, [2.0, 10.0], [6.0, 3.0])
-      apply_angle = self.apply_angle_last + apply_center_deadzone(apply_angle - self.apply_angle_last, deadzone)
+    # Smooth low-speed requests without holding small corrections. Fade out by 10 m/s
+    # to avoid adding high-speed lag; final vehicle-model and rate limits still apply.
+    if lat_active:
+      self.angle_filter.update_alpha(float(np.interp(CS.out.vEgoRaw, [2.0, 10.0], [0.1, 0.0])))
+      apply_angle = self.angle_filter.update(apply_angle)
 
     self.apply_angle_last = apply_steer_angle_limits_vm(apply_angle, self.apply_angle_last, CS.out.vEgoRaw,
                                                         CS.out.steeringAngleDeg, lat_active, CarControllerParams, self.VM)
+    if not lat_active:
+      # Seed from the inactive command, including the synchronization frame before engagement.
+      self.angle_filter.x = self.apply_angle_last
     self.lat_active_prev = lat_requested
     return subarucan.create_steering_control_angle(self.packer, self.apply_angle_last, lat_active)
 

@@ -1,3 +1,4 @@
+import math
 import unittest
 from types import SimpleNamespace
 
@@ -90,7 +91,113 @@ class TestSubaruCarController(unittest.TestCase):
     controller.handle_angle_lateral(CC, CS)
 
     self.assertEqual(controller.apply_angle_last, CS.out.steeringAngleDeg)
+    self.assertEqual(controller.angle_filter.x, controller.apply_angle_last)
     self.assertFalse(controller.lat_active_prev)
+
+  def test_angle_filter_small_correction_and_time_response(self):
+    controller = self._controller()
+    CS = self._state(1.0, 0.0)
+    CC = self._control(True, 4.0)  # Below the previous low-speed deadzone.
+    self.assertFalse(controller.handle_angle_lateral(CC, CS)[1][1] & 0x10)
+    for _ in range(5):  # Five 50 Hz updates are 100 ms.
+      controller.handle_angle_lateral(CC, CS)
+    self.assertAlmostEqual(controller.apply_angle_last / 4.0, 1 - (5 / 6)**5)
+    for _ in range(45):
+      controller.handle_angle_lateral(CC, CS)
+    self.assertAlmostEqual(controller.apply_angle_last, 4.0, places=3)
+
+  def test_angle_filter_weakens_with_speed_and_bypasses(self):
+    first_steps = []
+    for speed in (0.0, 2.0, 6.0, 9.999, 10.0, 10.001):
+      controller = self._controller()
+      CS = self._state(speed, 0.0)
+      CC = self._control(True, 1.0)
+      controller.handle_angle_lateral(CC, CS)
+      controller.handle_angle_lateral(CC, CS)
+      first_steps.append(controller.apply_angle_last)
+    self.assertEqual(first_steps[0], first_steps[1])
+    self.assertLess(first_steps[1], first_steps[2])
+    self.assertLess(first_steps[2], first_steps[3])
+    self.assertAlmostEqual(first_steps[3], first_steps[4], delta=0.003)
+    self.assertEqual(first_steps[4:], [1.0, 1.0])
+
+  def test_angle_filter_speed_transition_tracks_current_target(self):
+    controller = self._controller()
+    CS = self._state(2.0, 0.0)
+    CC = self._control(True, 1.0)
+    controller.handle_angle_lateral(CC, CS)
+    controller.handle_angle_lateral(CC, CS)
+    CS.out.vEgoRaw = 10.0
+    controller.handle_angle_lateral(CC, CS)
+    self.assertEqual(controller.apply_angle_last, 1.0)
+    CC.actuators.steeringAngleDeg = -0.5
+    controller.handle_angle_lateral(CC, CS)
+    self.assertEqual(controller.apply_angle_last, -0.5)
+    CS.out.vEgoRaw = 2.0
+    controller.handle_angle_lateral(CC, CS)
+    self.assertEqual(controller.apply_angle_last, -0.5)
+
+  def test_angle_filter_attenuates_repeated_requests(self):
+    controller = self._controller()
+    CS = self._state(1.0, 0.0)
+    controller.handle_angle_lateral(self._control(True, 0.0), CS)
+    requested, sent = [], []
+    for frame in range(200):
+      target = 3 * math.sin(2 * math.pi * 2.5 * frame * 0.02)
+      controller.handle_angle_lateral(self._control(True, target), CS)
+      if frame >= 100:
+        requested.append(target)
+        sent.append(controller.apply_angle_last)
+    amplitude_ratio = math.sqrt(sum(a*a for a in sent) / sum(a*a for a in requested))
+    self.assertGreater(amplitude_ratio, 0.4)
+    self.assertLess(amplitude_ratio, 0.6)
+
+  def test_angle_filter_resets_on_every_inactive_frame(self):
+    for exit_reason in ("disengage", "fault", "cruise", "accel_limit"):
+      with self.subTest(exit_reason=exit_reason):
+        controller = self._controller()
+        CS = self._state(1.0, 0.0)
+        CC = self._control(True, 100.0)
+        for _ in range(30):
+          controller.handle_angle_lateral(CC, CS)
+        if exit_reason == "disengage":
+          CC.latActive = False
+        elif exit_reason == "fault":
+          CS.out.steerFaultTemporary = True
+        elif exit_reason == "cruise":
+          CS.out.cruiseState.enabled = False
+        else:
+          CS.out.vEgoRaw = 40.0
+        for measured in (-30.0, -40.0):
+          CS.out.steeringAngleDeg = measured
+          self.assertFalse(controller.handle_angle_lateral(CC, CS)[1][1] & 0x10)
+          self.assertEqual(controller.apply_angle_last, measured)
+          self.assertEqual(controller.angle_filter.x, measured)
+        CS = self._state(1.0, -40.0)
+        CC = self._control(True, -40.0)
+        for _ in range(3):
+          controller.handle_angle_lateral(CC, CS)
+          self.assertEqual(controller.apply_angle_last, -40.0)
+
+  def test_filtered_commands_pass_panda_limits(self):
+    from opendbc.safety.tests.libsafety.libsafety_py import make_CANPacket
+    from opendbc.safety.tests.test_subaru import TestSubaruGen2AngleStockLongitudinalSafety
+
+    safety_case = TestSubaruGen2AngleStockLongitudinalSafety()
+    for speed in (0.0, 2.0, 6.0, 9.99, 10.0, 10.01, 20.0, 40.0):
+      with self.subTest(speed=speed):
+        safety_case.setUp()
+        safety_case._reset_speed_measurement(speed)
+        safety_case.safety.set_controls_allowed(True)
+        controller = self._controller()
+        for frame in range(200):
+          safety_case.safety.set_timer(frame * 20000)
+          measured = controller.apply_angle_last
+          safety_case._rx(safety_case._angle_meas_msg(measured))
+          CS = self._state(speed, measured)
+          CC = self._control(frame % 50 != 0, 250.0 if frame % 100 < 50 else -250.0)
+          addr, data, bus = controller.handle_angle_lateral(CC, CS)
+          self.assertTrue(safety_case._tx(make_CANPacket(addr, bus, data)))
 
   def test_fault_or_cruise_exit_overrides_stale_active_request(self):
     for fault, cruise in ((True, True), (False, False)):
@@ -106,6 +213,7 @@ class TestSubaruCarController(unittest.TestCase):
           CS.out.steeringAngleDeg = measured
           self.assertFalse(controller.handle_angle_lateral(CC, CS)[1][1] & 0x10)
           self.assertEqual(controller.apply_angle_last, measured)
+          self.assertEqual(controller.angle_filter.x, measured)
         CS.out.steerFaultTemporary = False
         CS.out.cruiseState.enabled = True
         self.assertFalse(controller.handle_angle_lateral(CC, CS)[1][1] & 0x10)
