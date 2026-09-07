@@ -181,6 +181,44 @@ class TestSubaruAngleSafetyBase(TestSubaruSafetyBase, common.AngleSteeringSafety
     # The generic test assumes breakpoint-based limits. Vehicle-model acceleration and jerk are tested below.
     pass
 
+  def test_active_angle_hard_limits(self):
+    self._reset_speed_measurement(1)
+    for sign in (-1, 1):
+      for angle in (190, 190.01):
+        self.safety.set_controls_allowed(True)
+        self.safety.set_desired_angle_last(round(angle * sign * self.DEG_TO_CAN))
+        self.assertEqual(angle <= 190, self._tx(self._angle_cmd_msg(angle * sign, True)))
+      for delta in (5, 5.01, 5.02, 10):
+        self.safety.set_controls_allowed(True)
+        self.safety.set_desired_angle_last(0)
+        self.assertEqual(delta <= 5.01, self._tx(self._angle_cmd_msg(delta * sign, True)))
+        if delta > 5.01:
+          self.assertEqual(self.safety.get_desired_angle_last(), 0)
+
+  def test_controller_engagement_passes_safety(self):
+    from types import SimpleNamespace
+    from opendbc.car.subaru.carcontroller import CarController
+    from opendbc.car.subaru.interface import CarInterface
+    from opendbc.car.subaru.values import CAR
+
+    for speed in (5, 15, 30.8, 40):
+      for sign in (-1, 1):
+        self._reset_speed_measurement(speed)
+        self.safety.set_controls_allowed(True)
+        self.safety.set_desired_angle_last(0)
+        controller = CarController({}, CarInterface.get_non_essential_params(CAR.SUBARU_OUTBACK_2023))
+        CC = SimpleNamespace(latActive=False, actuators=SimpleNamespace(steeringAngleDeg=0))
+        CS = SimpleNamespace(out=SimpleNamespace(vEgoRaw=speed, steeringAngleDeg=0))
+        for frame in range(30):
+          # ACC engages between two angle samples. The wheel also moves during the handoff.
+          CS.out.steeringAngleDeg = sign * (0.43 if frame == 0 else 0.62 + min(frame - 1, 3) * 0.15)
+          self._rx(self._angle_meas_msg(CS.out.steeringAngleDeg))
+          CC.latActive = 1 <= frame < 20 or frame >= 23
+          CC.actuators.steeringAngleDeg = sign * 3
+          addr, data, bus = controller.handle_angle_lateral(CC, CS)
+          self.safety.set_timer(frame * 20000)
+          self.assertTrue(self._tx(libsafety_py.make_CANPacket(addr, bus, data)), (speed, sign, frame))
+
   def _find_max_allowed_angle_can(self, sign):
     lo, hi = 0, self.STEER_ANGLE_MAX * self.DEG_TO_CAN + 10
     while lo < hi:
@@ -211,9 +249,8 @@ class TestSubaruAngleSafetyBase(TestSubaruSafetyBase, common.AngleSteeringSafety
         self.safety.set_desired_angle_last(above_limit_can * sign)
         self._tx(self._angle_cmd_msg(above_limit_can / self.DEG_TO_CAN * sign, True))
 
-        # At low speed the model limit exceeds the EPS limit, so the extra CAN unit clips to the same command.
-        should_tx = max_angle_can >= self.STEER_ANGLE_MAX * self.DEG_TO_CAN
-        self.assertEqual(should_tx, self._tx(self._angle_cmd_msg(above_limit_can / self.DEG_TO_CAN * sign, True)))
+        # One CAN unit beyond either the model or EPS limit must be rejected, even at low speed.
+        self.assertFalse(self._tx(self._angle_cmd_msg(above_limit_can / self.DEG_TO_CAN * sign, True)))
 
   def _find_max_allowed_delta_can(self, sign):
     lo, hi = 0, self.STEER_ANGLE_MAX * self.DEG_TO_CAN

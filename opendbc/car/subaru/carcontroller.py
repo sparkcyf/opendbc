@@ -1,7 +1,8 @@
 import numpy as np
 from opendbc.can import CANPacker
 from opendbc.car import Bus, make_tester_present_msg
-from opendbc.car.lateral import apply_center_deadzone, apply_driver_steer_torque_limits, apply_steer_angle_limits_vm, common_fault_avoidance
+from opendbc.car.lateral import (apply_center_deadzone, apply_driver_steer_torque_limits, apply_steer_angle_limits_vm,
+                                 common_fault_avoidance, get_max_angle_vm)
 from opendbc.car.interfaces import CarControllerBase
 from opendbc.car.subaru import subarucan
 from opendbc.car.subaru.values import DBC, GLOBAL_ES_ADDR, CanBus, CarControllerParams, SubaruFlags
@@ -25,6 +26,7 @@ class CarController(CarControllerBase):
     self.apply_torque_last = 0
     self.apply_angle_last = 0.0
     self.lat_active_prev = False
+    self.es_distance_counter_last = -1
 
     self.cruise_button_prev = 0
     self.steer_rate_counter = 0
@@ -34,23 +36,26 @@ class CarController(CarControllerBase):
     self.VM = VehicleModel(get_safety_cp()) if CP.flags & SubaruFlags.LKAS_ANGLE else None
 
   def handle_angle_lateral(self, CC, CS):
-    # Re-anchor the first active command to the live steering angle so controller and Panda safety
-    # begin from the same reference instead of a stale inactive command.
-    if CC.latActive and not self.lat_active_prev:
-      self.apply_angle_last = CS.out.steeringAngleDeg
+    # Synchronize with safety using an inactive command before engaging. Re-anchoring only the
+    # controller on the first active frame can violate safety's rate limit from the previous command.
+    lat_active = CC.latActive and self.lat_active_prev
+    assert self.VM is not None
+    max_angle = get_max_angle_vm(max(CS.out.vEgoRaw, 1), self.VM, CarControllerParams)
+    # An inactive reference can be outside the speed-dependent limit. Keep tracking the wheel until
+    # it is possible to engage without violating either the acceleration or the jerk limit.
+    lat_active = lat_active and abs(self.apply_angle_last) <= max_angle
 
     apply_angle = CC.actuators.steeringAngleDeg
     # The source Crosstrek oscillated at low speeds. Keep its conservative speed-dependent deadzone
     # for the first Outback tests, then tune or remove it using Outback data.
-    if CC.latActive and CS.out.vEgoRaw < 10.0:
+    if lat_active and CS.out.vEgoRaw < 10.0:
       deadzone = np.interp(CS.out.vEgoRaw, [2.0, 10.0], [6.0, 3.0])
       apply_angle = self.apply_angle_last + apply_center_deadzone(apply_angle - self.apply_angle_last, deadzone)
 
-    assert self.VM is not None
     self.apply_angle_last = apply_steer_angle_limits_vm(apply_angle, self.apply_angle_last, CS.out.vEgoRaw,
-                                                        CS.out.steeringAngleDeg, CC.latActive, CarControllerParams, self.VM)
+                                                        CS.out.steeringAngleDeg, lat_active, CarControllerParams, self.VM)
     self.lat_active_prev = CC.latActive
-    return subarucan.create_steering_control_angle(self.packer, self.apply_angle_last, CC.latActive)
+    return subarucan.create_steering_control_angle(self.packer, self.apply_angle_last, lat_active)
 
   def handle_torque_lateral(self, CC, CS):
     apply_torque = int(round(CC.actuators.torque * self.p.STEER_MAX))
@@ -150,10 +155,15 @@ class CarController(CarControllerBase):
           can_sends.append(subarucan.create_es_distance(self.packer, self.frame // 5, CS.es_distance_msg, 0, pcm_cancel_cmd,
                                                         self.CP.openpilotLongitudinalControl, cruise_brake > 0, cruise_throttle))
       else:
-        if pcm_cancel_cmd:
-          if not (self.CP.flags & SubaruFlags.HYBRID):
+        if not (self.CP.flags & SubaruFlags.HYBRID):
+          counter = CS.es_distance_msg["COUNTER"]
+          # Gen2 injects cancel on the alternate bus alongside EyeSight. Do not repeatedly inject
+          # the same counter at the 100 Hz control rate while waiting for a new stock message.
+          new_distance = counter != self.es_distance_counter_last
+          if pcm_cancel_cmd and (not (self.CP.flags & SubaruFlags.GLOBAL_GEN2) or new_distance):
             bus = CanBus.alt if self.CP.flags & SubaruFlags.GLOBAL_GEN2 else CanBus.main
-            can_sends.append(subarucan.create_es_distance(self.packer, CS.es_distance_msg["COUNTER"] + 1, CS.es_distance_msg, bus, pcm_cancel_cmd))
+            can_sends.append(subarucan.create_es_distance(self.packer, counter + 1, CS.es_distance_msg, bus, pcm_cancel_cmd))
+          self.es_distance_counter_last = counter
 
       if self.CP.flags & SubaruFlags.DISABLE_EYESIGHT:
         # Tester present (keeps eyesight disabled)

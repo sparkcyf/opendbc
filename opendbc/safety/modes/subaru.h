@@ -167,7 +167,16 @@ static bool subaru_tx_hook(const CANPacket_t *msg) {
     desired_angle = -1 * to_signed(desired_angle, 17);
     bool steer_req = GET_BIT(msg, 12U);
 
+    if (controls_allowed && steer_req) {
+      // Match the controller's EPS/low-speed limits as well as the vehicle-model limits.
+      const int max_angle_delta = (5 * 100) + 1;  // 5 deg/frame plus CAN quantization tolerance
+      violation |= safety_max_limit_check(desired_angle, SUBARU_ANGLE_STEERING_LIMITS.max_angle, -SUBARU_ANGLE_STEERING_LIMITS.max_angle);
+      violation |= safety_max_limit_check(desired_angle, desired_angle_last + max_angle_delta, desired_angle_last - max_angle_delta);
+    }
     violation |= steer_angle_cmd_checks_vm(desired_angle, steer_req, SUBARU_ANGLE_STEERING_LIMITS, SUBARU_ANGLE_STEERING_PARAMS);
+    if (violation) {
+      desired_angle_last = SAFETY_CLAMP(angle_meas.values[0], -SUBARU_ANGLE_STEERING_LIMITS.max_angle, SUBARU_ANGLE_STEERING_LIMITS.max_angle);
+    }
   }
 
   // Torque steer command checks
