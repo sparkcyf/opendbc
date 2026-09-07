@@ -38,7 +38,10 @@ class CarController(CarControllerBase):
   def handle_angle_lateral(self, CC, CS):
     # Synchronize with safety using an inactive command before engaging. Re-anchoring only the
     # controller on the first active frame can violate safety's rate limit from the previous command.
-    lat_active = CC.latActive and self.lat_active_prev
+    # Act on the latest state even if carControl has not yet reacted to a rejected
+    # TX or cruise exit. Continue sending inactive measured-angle messages at 50 Hz.
+    lat_requested = CC.latActive and CS.out.cruiseState.enabled and not CS.out.steerFaultTemporary
+    lat_active = lat_requested and self.lat_active_prev
     assert self.VM is not None
     max_angle = get_max_angle_vm(max(CS.out.vEgoRaw, 1), self.VM, CarControllerParams)
     # An inactive reference can be outside the speed-dependent limit. Keep tracking the wheel until
@@ -54,7 +57,7 @@ class CarController(CarControllerBase):
 
     self.apply_angle_last = apply_steer_angle_limits_vm(apply_angle, self.apply_angle_last, CS.out.vEgoRaw,
                                                         CS.out.steeringAngleDeg, lat_active, CarControllerParams, self.VM)
-    self.lat_active_prev = CC.latActive
+    self.lat_active_prev = lat_requested
     return subarucan.create_steering_control_angle(self.packer, self.apply_angle_last, lat_active)
 
   def handle_torque_lateral(self, CC, CS):

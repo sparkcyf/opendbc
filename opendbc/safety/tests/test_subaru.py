@@ -2,9 +2,13 @@
 import enum
 import unittest
 from functools import partial
+from itertools import product
 
 import numpy as np
 
+from opendbc.car import CanData, structs
+from opendbc.car.subaru.interface import CarInterface
+from opendbc.car.subaru.values import CAR
 from opendbc.car.subaru.values import SubaruSafetyFlags
 from opendbc.car.structs import CarParams
 from opendbc.car.vehicle_model import VehicleModel
@@ -208,7 +212,8 @@ class TestSubaruAngleSafetyBase(TestSubaruSafetyBase, common.AngleSteeringSafety
         self.safety.set_desired_angle_last(0)
         controller = CarController({}, CarInterface.get_non_essential_params(CAR.SUBARU_OUTBACK_2023))
         CC = SimpleNamespace(latActive=False, actuators=SimpleNamespace(steeringAngleDeg=0))
-        CS = SimpleNamespace(out=SimpleNamespace(vEgoRaw=speed, steeringAngleDeg=0))
+        CS = SimpleNamespace(out=SimpleNamespace(vEgoRaw=speed, steeringAngleDeg=0,
+                                                 cruiseState=SimpleNamespace(enabled=True), steerFaultTemporary=False))
         for frame in range(30):
           # ACC engages between two angle samples. The wheel also moves during the handoff.
           CS.out.steeringAngleDeg = sign * (0.43 if frame == 0 else 0.62 + min(frame - 1, 3) * 0.15)
@@ -303,6 +308,61 @@ class TestSubaruGen2AngleStockLongitudinalSafety(TestSubaruStockLongitudinalSafe
   RELAY_MALFUNCTION_ADDRS = {SUBARU_MAIN_BUS: (SubaruMsg.ES_LKAS_ANGLE, SubaruMsg.ES_DashStatus, SubaruMsg.ES_LKAS_State,
                                                SubaruMsg.ES_Infotainment)}
   FWD_BLACKLISTED_ADDRS = fwd_blacklisted_addr(SubaruMsg.ES_LKAS_ANGLE)
+
+  def test_controller_recovers_rejected_tx_without_active_retry(self):
+    for speed, sign, feedback_delay, fault_frame in product((0, 5, 30.8, 40), (-1, 1), (1, 2, 4), (0, 20)):
+      with self.subTest(speed=speed, sign=sign, feedback_delay=feedback_delay, fault_frame=fault_frame):
+        self.setUp()
+        CI = CarInterface(CarInterface.get_non_essential_params(CAR.SUBARU_OUTBACK_2023))
+        CI.update([])
+        CC = structs.CarControl(latActive=True)
+        CC.actuators.steeringAngleDeg = sign * 1.2
+        pending = []
+        last_counter = None
+        for frame in range(80):
+          self.safety.set_timer(frame * 10000)
+          enabled = not 60 <= frame < 66
+          measured = sign * (0.1 if frame < 40 else 0.2)
+          messages = [
+            self.packer.make_can_msg("ES_Status", 1, {"Cruise_Activated": enabled}),
+            self.packer.make_can_msg("Steering_2", 0, {"Steering_Angle": measured}),
+            self.packer.make_can_msg("Wheel_Speeds", 1, {wheel: speed * 3.6 for wheel in ("FL", "FR", "RL", "RR")}),
+          ]
+          for addr, data, bus in messages:
+            self.assertTrue(self._rx(libsafety_py.make_CANPacket(addr, bus, data)))
+          feedback = [msg for due, msg in pending if due == frame]
+          CI.update([(frame * 10000000, [*messages, *feedback])])
+          # Simulate controlsd reacting late and even trying to re-enable.
+          CC.latActive = not 44 <= frame < 48
+          if frame == fault_frame == 0:
+            CI.CS.out.steeringAngleDeg = sign * 0.62  # Stale first inactive reference, outside Panda's window.
+          _, sends = CI.apply(CC.as_reader(), frame * 10000000)
+          angle_sends = [msg for msg in sends if msg[0] == 0x124]
+          self.assertEqual(len(angle_sends), int(frame % 2 == 0))
+          for addr, data, bus in angle_sends:
+            counter = data[1] & 0xf
+            if last_counter is not None:
+              self.assertEqual(counter, (last_counter + 1) % 16)
+            last_counter = counter
+            active = bool(data[1] & 0x10)
+            if fault_frame + feedback_delay <= frame < 66:
+              self.assertFalse(active)
+              self.assertAlmostEqual(CI.CC.apply_angle_last, measured, places=2)
+            elif frame >= 68:
+              self.assertTrue(active)
+            if frame == 66:
+              self.assertFalse(active)  # Fresh engagement must synchronize again.
+            if frame == fault_frame == 20:
+              # One out-of-bounds TX resets Panda's desired-angle history.
+              data = self.packer.make_can_msg("ES_LKAS_ANGLE", 0,
+                {"LKAS_Request": 1, "LKAS_Output": sign * 200})[1]
+            accepted = self._tx(libsafety_py.make_CANPacket(addr, bus, data))
+            if frame == fault_frame:
+              self.assertFalse(accepted)
+            elif frame >= fault_frame + feedback_delay or frame < fault_frame:
+              self.assertTrue(accepted)
+            if not accepted:
+              pending.append((frame + feedback_delay, CanData(addr, data, 0xC0)))
 
 
 if __name__ == "__main__":

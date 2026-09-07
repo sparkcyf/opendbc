@@ -1,4 +1,4 @@
-from opendbc.car import get_safety_config, structs, uds
+from opendbc.car import CanData, get_safety_config, structs, uds
 from opendbc.car.disable_ecu import disable_ecu
 from opendbc.car.interfaces import CarInterfaceBase
 from opendbc.car.subaru.carcontroller import CarController
@@ -9,6 +9,20 @@ from opendbc.car.subaru.values import CAR, GLOBAL_ES_ADDR, SubaruFlags, SubaruSa
 class CarInterface(CarInterfaceBase):
   CarState = CarState
   CarController = CarController
+
+  def update(self, can_packets: list[tuple[int, list[CanData]]]) -> structs.CarState:
+    ret = super().update(can_packets)
+    if self.CP.flags & SubaruFlags.LKAS_ANGLE:
+      # Panda returns rejected bus-0 TX on 0xC0. Inspect the envelope directly:
+      # rejected payloads need not pass a DBC checksum/counter parser.
+      if not ret.cruiseState.enabled:
+        self.CS.lkas_angle_rejected = False
+      elif any(bus == 0xC0 and address == 0x124 for _, messages in can_packets for address, _, bus in messages):
+        self.CS.lkas_angle_rejected = True
+      # Keep steering inactive until stock ACC exits, rather than automatically
+      # retrying a command stream which may no longer match Panda's reference.
+      ret.steerFaultTemporary |= self.CS.lkas_angle_rejected
+    return ret
 
   @staticmethod
   def _get_params(ret: structs.CarParams, candidate: CAR, fingerprint, car_fw, alpha_long, is_release, docs) -> structs.CarParams:

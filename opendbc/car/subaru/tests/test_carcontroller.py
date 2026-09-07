@@ -18,7 +18,8 @@ class TestSubaruCarController(unittest.TestCase):
 
   @staticmethod
   def _state(speed, steering_angle):
-    return SimpleNamespace(out=SimpleNamespace(vEgoRaw=speed, steeringAngleDeg=steering_angle))
+    return SimpleNamespace(out=SimpleNamespace(vEgoRaw=speed, steeringAngleDeg=steering_angle,
+                                               cruiseState=SimpleNamespace(enabled=True), steerFaultTemporary=False))
 
   @staticmethod
   def _control(lat_active, requested_angle):
@@ -90,6 +91,25 @@ class TestSubaruCarController(unittest.TestCase):
 
     self.assertEqual(controller.apply_angle_last, CS.out.steeringAngleDeg)
     self.assertFalse(controller.lat_active_prev)
+
+  def test_fault_or_cruise_exit_overrides_stale_active_request(self):
+    for fault, cruise in ((True, True), (False, False)):
+      with self.subTest(fault=fault, cruise=cruise):
+        controller = self._controller()
+        CS = self._state(30.8, 0)
+        CC = self._control(True, -1.2)
+        controller.handle_angle_lateral(CC, CS)
+        self.assertTrue(controller.handle_angle_lateral(CC, CS)[1][1] & 0x10)
+        CS.out.steerFaultTemporary = fault
+        CS.out.cruiseState.enabled = cruise
+        for measured in (0.1, -0.2, 0.5):
+          CS.out.steeringAngleDeg = measured
+          self.assertFalse(controller.handle_angle_lateral(CC, CS)[1][1] & 0x10)
+          self.assertEqual(controller.apply_angle_last, measured)
+        CS.out.steerFaultTemporary = False
+        CS.out.cruiseState.enabled = True
+        self.assertFalse(controller.handle_angle_lateral(CC, CS)[1][1] & 0x10)
+        self.assertTrue(controller.handle_angle_lateral(CC, CS)[1][1] & 0x10)
 
   def test_gen2_cancel_once_per_received_counter(self):
     controller = self._controller()
