@@ -14,7 +14,7 @@ from opendbc.car.structs import CarParams
 from opendbc.car.vehicle_model import VehicleModel
 from opendbc.safety.tests.libsafety import libsafety_py
 import opendbc.safety.tests.common as common
-from opendbc.safety.tests.common import CANPackerSafety, away_round, round_speed
+from opendbc.safety.tests.common import away_round, round_speed
 
 
 class SubaruMsg(enum.IntEnum):
@@ -51,7 +51,9 @@ def fwd_blacklisted_addr(lkas_msg=SubaruMsg.ES_LKAS):
 
 
 class TestSubaruSafetyBase(common.CarSafetyTest):
-  FLAGS = 0
+  DBC = "subaru_global_2017_generated"
+  SAFETY_MODEL = CarParams.SafetyModel.subaru
+
   RELAY_MALFUNCTION_ADDRS = {SUBARU_MAIN_BUS: (SubaruMsg.ES_LKAS, SubaruMsg.ES_DashStatus, SubaruMsg.ES_LKAS_State,
                                                SubaruMsg.ES_Infotainment)}
   FWD_BLACKLISTED_ADDRS = fwd_blacklisted_addr()
@@ -67,12 +69,6 @@ class TestSubaruSafetyBase(common.CarSafetyTest):
   DEG_TO_CAN = 100
 
   INACTIVE_GAS = 1818
-
-  def setUp(self):
-    self.packer = CANPackerSafety("subaru_global_2017_generated")
-    self.safety = libsafety_py.libsafety
-    self.safety.set_safety_hooks(CarParams.SafetyModel.subaru, self.FLAGS)
-    self.safety.init_tests()
 
   def _set_prev_torque(self, t):
     self.safety.set_desired_torque_last(t)
@@ -126,7 +122,6 @@ class TestSubaruTorqueSafetyBase(TestSubaruSafetyBase, common.DriverTorqueSteeri
 
 
 class TestSubaruGen1TorqueStockLongitudinalSafety(TestSubaruStockLongitudinalSafetyBase, TestSubaruTorqueSafetyBase):
-  FLAGS = 0
   TX_MSGS = lkas_tx_msgs(SUBARU_MAIN_BUS)
 
 
@@ -140,7 +135,8 @@ class TestSubaruGen2TorqueSafetyBase(TestSubaruTorqueSafetyBase):
 
 
 class TestSubaruGen2TorqueStockLongitudinalSafety(TestSubaruStockLongitudinalSafetyBase, TestSubaruGen2TorqueSafetyBase):
-  FLAGS = SubaruSafetyFlags.GEN2
+  SAFETY_PARAM = SubaruSafetyFlags.GEN2
+
   TX_MSGS = lkas_tx_msgs(SUBARU_ALT_BUS)
 
 
@@ -149,9 +145,6 @@ class TestSubaruAngleSafetyBase(TestSubaruSafetyBase, common.AngleSteeringSafety
   DEG_TO_CAN = 100
 
   # Vehicle-model limits are tested explicitly below instead of using breakpoint-based generic tests.
-  ANGLE_RATE_BP = None
-  ANGLE_RATE_UP = None
-  ANGLE_RATE_DOWN = None
   LATERAL_FREQUENCY = 50
 
   def setUp(self):
@@ -197,7 +190,8 @@ class TestSubaruAngleSafetyBase(TestSubaruSafetyBase, common.AngleSteeringSafety
         self.safety.set_desired_angle_last(0)
         self.assertEqual(delta <= 5.01, self._tx(self._angle_cmd_msg(delta * sign, True)))
         if delta > 5.01:
-          self.assertEqual(self.safety.get_desired_angle_last(), 0)
+          # History resets to the measured angle: only passes the rate limit from 0, not from the rejected command
+          self.assertTrue(self._tx(self._angle_cmd_msg(-4 * sign, True)))
 
   def test_controller_engagement_passes_safety(self):
     from types import SimpleNamespace
@@ -294,7 +288,7 @@ class TestSubaruAngleSafetyBase(TestSubaruSafetyBase, common.AngleSteeringSafety
 
 
 class TestSubaruGen1AngleStockLongitudinalSafety(TestSubaruStockLongitudinalSafetyBase, TestSubaruAngleSafetyBase):
-  FLAGS = SubaruSafetyFlags.LKAS_ANGLE
+  SAFETY_PARAM = SubaruSafetyFlags.LKAS_ANGLE
   TX_MSGS = lkas_tx_msgs(SUBARU_MAIN_BUS, SubaruMsg.ES_LKAS_ANGLE)
   RELAY_MALFUNCTION_ADDRS = {SUBARU_MAIN_BUS: (SubaruMsg.ES_LKAS_ANGLE, SubaruMsg.ES_DashStatus, SubaruMsg.ES_LKAS_State,
                                                SubaruMsg.ES_Infotainment)}
@@ -303,7 +297,7 @@ class TestSubaruGen1AngleStockLongitudinalSafety(TestSubaruStockLongitudinalSafe
 
 class TestSubaruGen2AngleStockLongitudinalSafety(TestSubaruStockLongitudinalSafetyBase, TestSubaruAngleSafetyBase):
   ALT_MAIN_BUS = SUBARU_ALT_BUS
-  FLAGS = SubaruSafetyFlags.GEN2 | SubaruSafetyFlags.LKAS_ANGLE
+  SAFETY_PARAM = SubaruSafetyFlags.GEN2 | SubaruSafetyFlags.LKAS_ANGLE
   TX_MSGS = lkas_tx_msgs(SUBARU_ALT_BUS, SubaruMsg.ES_LKAS_ANGLE)
   RELAY_MALFUNCTION_ADDRS = {SUBARU_MAIN_BUS: (SubaruMsg.ES_LKAS_ANGLE, SubaruMsg.ES_DashStatus, SubaruMsg.ES_LKAS_State,
                                                SubaruMsg.ES_Infotainment)}
