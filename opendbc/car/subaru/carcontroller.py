@@ -27,6 +27,7 @@ class CarController(CarControllerBase):
     self.apply_torque_last = 0
     self.apply_angle_last = 0.0
     self.lat_active_prev = False
+    self.lat_steering_prev = False
     self.es_distance_counter_last = -1
 
     self.cruise_button_prev = 0
@@ -47,7 +48,11 @@ class CarController(CarControllerBase):
     assert self.VM is not None
     max_angle = get_max_angle_vm(max(CS.out.vEgoRaw, 1), self.VM, CarControllerParams)
     # An inactive reference can be outside the speed-dependent limit. Keep tracking the wheel until
-    # it is possible to engage without violating either the acceleration or the jerk limit.
+    # it is possible to engage without violating either the acceleration or the jerk limit. Once
+    # steering, wheel-speed noise must not drop the request at the limit: the target is already clipped,
+    # so keep steering back inside it while the last angle is within safety's limit at its fudged speed.
+    if self.lat_steering_prev:
+      max_angle = get_max_angle_vm(max(CS.out.vEgoRaw - 1, 1), self.VM, CarControllerParams)
     lat_active = lat_active and abs(self.apply_angle_last) <= max_angle
 
     apply_angle = CC.actuators.steeringAngleDeg
@@ -63,6 +68,7 @@ class CarController(CarControllerBase):
       # Seed from the inactive command, including the synchronization frame before engagement.
       self.angle_filter.x = self.apply_angle_last
     self.lat_active_prev = lat_requested
+    self.lat_steering_prev = lat_active
     return subarucan.create_steering_control_angle(self.packer, self.apply_angle_last, lat_active)
 
   def handle_torque_lateral(self, CC, CS):

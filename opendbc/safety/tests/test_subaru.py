@@ -7,8 +7,9 @@ from itertools import product
 import numpy as np
 
 from opendbc.car import CanData, structs
+from opendbc.car.lateral import get_max_angle_vm
 from opendbc.car.subaru.interface import CarInterface
-from opendbc.car.subaru.values import CAR
+from opendbc.car.subaru.values import CAR, CarControllerParams
 from opendbc.car.subaru.values import SubaruSafetyFlags
 from opendbc.car.structs import CarParams
 from opendbc.car.vehicle_model import VehicleModel
@@ -78,8 +79,8 @@ class TestSubaruSafetyBase(common.CarSafetyTest):
     values = {"Steer_Torque_Sensor": torque}
     return self.packer.make_can_msg_safety("Steering_Torque", 0, values)
 
-  def _speed_msg(self, speed):
-    values = {s: speed for s in ["FR", "FL", "RR", "RL"]}
+  def _speed_msg(self, speed, wheels=("FR", "FL", "RR", "RL")):
+    values = {s: speed if s in wheels else 0 for s in ["FR", "FL", "RR", "RL"]}
     return self.packer.make_can_msg_safety("Wheel_Speeds", self.ALT_MAIN_BUS, values)
 
   def _user_brake_msg(self, brake):
@@ -93,6 +94,14 @@ class TestSubaruSafetyBase(common.CarSafetyTest):
   def _pcm_status_msg(self, enable):
     values = {"Cruise_Activated": enable}
     return self.packer.make_can_msg_safety("CruiseControl", self.ALT_MAIN_BUS, values)
+
+  def test_vehicle_moving_any_wheel(self):
+    # any single wheel reporting a non-zero speed means the vehicle is moving
+    for wheel in ["FR", "FL", "RR", "RL"]:
+      self._rx(self._speed_msg(0))
+      self.assertFalse(self.safety.get_vehicle_moving())
+      self._rx(self._speed_msg(1, wheels=(wheel,)))
+      self.assertTrue(self.safety.get_vehicle_moving())
 
 
 class TestSubaruStockLongitudinalSafetyBase(TestSubaruSafetyBase):
@@ -153,10 +162,10 @@ class TestSubaruAngleSafetyBase(TestSubaruSafetyBase, common.AngleSteeringSafety
     from opendbc.car.subaru.carcontroller import get_safety_cp
     self.VM = VehicleModel(get_safety_cp())
 
-  def _speed_msg(self, speed):
+  def _speed_msg(self, speed, wheels=("FR", "FL", "RR", "RL")):
     # Angle safety tests use m/s; the Subaru wheel-speed DBC signals use km/h.
     speed_kph = speed * 3.6
-    values = {s: speed_kph for s in ["FR", "FL", "RR", "RL"]}
+    values = {s: speed_kph if s in wheels else 0 for s in ["FR", "FL", "RR", "RL"]}
     return self.packer.make_can_msg_safety("Wheel_Speeds", self.ALT_MAIN_BUS, values)
 
   def _angle_cmd_msg(self, angle, enabled, increment_timer=True):
@@ -217,6 +226,84 @@ class TestSubaruAngleSafetyBase(TestSubaruSafetyBase, common.AngleSteeringSafety
           addr, data, bus = controller.handle_angle_lateral(CC, CS)
           self.safety.set_timer(frame * 20000)
           self.assertTrue(self._tx(libsafety_py.make_CANPacket(addr, bus, data)), (speed, sign, frame))
+
+  def _make_angle_controller(self, speed, angle, target, cruise_enabled=True):
+    from types import SimpleNamespace
+    from opendbc.car.subaru.carcontroller import CarController
+
+    controller = CarController({}, CarInterface.get_non_essential_params(CAR.SUBARU_OUTBACK_2023))
+    CC = SimpleNamespace(latActive=cruise_enabled, actuators=SimpleNamespace(steeringAngleDeg=target))
+    CS = SimpleNamespace(out=SimpleNamespace(vEgoRaw=speed, steeringAngleDeg=angle, steerFaultTemporary=False,
+                                             cruiseState=SimpleNamespace(enabled=cruise_enabled)))
+    return controller, CC, CS
+
+  def test_controller_engage_while_steering(self):
+    # Panda receives each Steering_2 sample before CarState does. When the driver is turning while
+    # engaging, panda's latest angle is one sample ahead of the angle the controller limits from.
+    engage_frame, total_frames = 52, 150
+    for speed in (5., 15., 26., 35.):
+      for rate in (-100., -16., 16., 100.):
+        with self.subTest(speed=speed, rate=rate):
+          self.setUp()
+          self._reset_speed_measurement(speed)
+          angle = angle_prev = -rate * 0.05
+          controller, CC, CS = self._make_angle_controller(speed, angle, 0., cruise_enabled=False)
+          for frame in range(0, total_frames, 2):
+            angle_prev = angle
+            if engage_frame - 10 <= frame < engage_frame:
+              angle += rate * 0.02
+            self._rx(self._angle_meas_msg(angle))
+            CS.out.steeringAngleDeg = CC.actuators.steeringAngleDeg = angle_prev
+            CS.out.cruiseState.enabled = CC.latActive = frame >= engage_frame
+            self.safety.set_controls_allowed(CC.latActive)
+            self.safety.set_timer(frame * 10000)
+            addr, data, bus = controller.handle_angle_lateral(CC, CS)
+            self.assertTrue(self._tx(libsafety_py.make_CANPacket(addr, bus, data)), frame)
+
+  def test_controller_keeps_request_at_accel_limit(self):
+    # Wheel-speed noise moves the limit past the last command while a curve demands more than the limit
+    for speed in (10., 15.7, 20., 30.):
+      with self.subTest(speed=speed):
+        self.setUp()
+        self._reset_speed_measurement(speed)
+        self.safety.set_controls_allowed(True)
+        max_angle = get_max_angle_vm(speed, self.VM, CarControllerParams)
+        angle = 0.8 * max_angle
+        controller, CC, CS = self._make_angle_controller(speed, angle, 1.15 * max_angle)
+        self._rx(self._angle_meas_msg(angle))
+        for frame in range(400):
+          CS.out.vEgoRaw = speed + (0.03 if frame % 5 == 0 else -0.03 if frame % 7 == 0 else 0.)
+          CS.out.steeringAngleDeg = angle
+          self._rx(self._angle_meas_msg(angle))
+          self.safety.set_timer(frame * 20000)
+          addr, data, bus = controller.handle_angle_lateral(CC, CS)
+          self.assertTrue(self._tx(libsafety_py.make_CANPacket(addr, bus, data)), frame)
+          # The first frame after creating the controller is the synchronization frame
+          self.assertEqual(bool(data[1] & 0x10), frame > 0, frame)
+          angle += 0.2 * (controller.apply_angle_last - angle)
+
+  def test_controller_accelerating_at_accel_limit_passes_safety(self):
+    # The limit can fall faster than the jerk limit allows steering back: drop the request before safety rejects
+    for speed in (3., 10., 25.):
+      for accel in (3., 6.):
+        for sign in (-1, 1):
+          with self.subTest(speed=speed, accel=accel, sign=sign):
+            self.setUp()
+            self._reset_speed_measurement(speed)
+            self.safety.set_controls_allowed(True)
+            angle = 0.
+            target = sign * min(get_max_angle_vm(speed, self.VM, CarControllerParams), 150.)
+            controller, CC, CS = self._make_angle_controller(speed, angle, target)
+            for frame in range(150):
+              CS.out.vEgoRaw += accel * 0.02
+              CS.out.steeringAngleDeg = angle
+              self._reset_speed_measurement(CS.out.vEgoRaw)
+              self._rx(self._angle_meas_msg(angle))
+              self.safety.set_timer(frame * 20000)
+              addr, data, bus = controller.handle_angle_lateral(CC, CS)
+              self.assertTrue(self._tx(libsafety_py.make_CANPacket(addr, bus, data)), frame)
+              if data[1] & 0x10:
+                angle = controller.apply_angle_last
 
   def _find_max_allowed_angle_can(self, sign):
     lo, hi = 0, self.STEER_ANGLE_MAX * self.DEG_TO_CAN + 10
