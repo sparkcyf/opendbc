@@ -62,9 +62,6 @@
   {.msg = {{MSG_SUBARU_ES_Status,       alt_bus,         8, 20U, .max_counter = 15U, .ignore_quality_flag = true}, { 0 }, { 0 }}},  \
   {.msg = {{MSG_SUBARU_Steering_2,      SUBARU_MAIN_BUS, 8, 50U, .max_counter = 15U, .ignore_quality_flag = true}, { 0 }, { 0 }}},  \
 
-static bool subaru_gen2 = false;
-static bool subaru_lkas_angle = false;
-
 static uint32_t subaru_get_checksum(const CANPacket_t *msg) {
   return (uint8_t)msg->data[0];
 }
@@ -83,29 +80,29 @@ static uint32_t subaru_compute_checksum(const CANPacket_t *msg) {
 }
 
 static void subaru_rx_hook(const CANPacket_t *msg) {
-  const unsigned int alt_main_bus = subaru_gen2 ? SUBARU_ALT_BUS : SUBARU_MAIN_BUS;
+  const unsigned int alt_main_bus = safety_setup.subaru_gen2 ? SUBARU_ALT_BUS : SUBARU_MAIN_BUS;
 
   // Steering angle measurement for angle-LKAS cars
-  if (subaru_lkas_angle && msg_matches(msg, MSG_SUBARU_Steering_2, SUBARU_MAIN_BUS)) {
+  if (safety_setup.subaru_lkas_angle && msg_matches(msg, MSG_SUBARU_Steering_2, SUBARU_MAIN_BUS)) {
     int angle_meas_new = GET_BYTES_LE(msg, 3, 3) & 0x1FFFFU;
     angle_meas_new = -1 * to_signed(angle_meas_new, 17);
-    update_sample(&angle_meas, angle_meas_new);
+    update_sample(&safety.angle_meas, angle_meas_new);
   }
 
   if (msg_matches(msg, MSG_SUBARU_Steering_Torque, SUBARU_MAIN_BUS)) {
     int torque_driver_new;
     torque_driver_new = ((GET_BYTES_LE(msg, 0, 4) >> 16) & 0x7FFU);
     torque_driver_new = -1 * to_signed(torque_driver_new, 11);
-    update_sample(&torque_driver, torque_driver_new);
+    update_sample(&safety.torque_driver, torque_driver_new);
   }
 
   // Enter controls on rising edge of ACC and exit on ACC off. Angle cars use the EyeSight status message;
   // ES_Brake's engagement bit can remain set after pressing the brake at standstill.
-  if (subaru_lkas_angle && msg_matches(msg, MSG_SUBARU_ES_Status, alt_main_bus)) {
+  if (safety_setup.subaru_lkas_angle && msg_matches(msg, MSG_SUBARU_ES_Status, alt_main_bus)) {
     bool cruise_engaged = (msg->data[3] >> 5) & 1U;
     pcm_cruise_check(cruise_engaged);
   }
-  if (!subaru_lkas_angle && msg_matches(msg, MSG_SUBARU_CruiseControl, alt_main_bus)) {
+  if (!safety_setup.subaru_lkas_angle && msg_matches(msg, MSG_SUBARU_CruiseControl, alt_main_bus)) {
     bool cruise_engaged = (msg->data[5] >> 1) & 1U;
     pcm_cruise_check(cruise_engaged);
   }
@@ -117,17 +114,17 @@ static void subaru_rx_hook(const CANPacket_t *msg) {
     uint32_t rl = (GET_BYTES_LE(msg, 4, 3) >> 6) & 0x1FFFU;
     uint32_t fl = (GET_BYTES_LE(msg, 6, 2) >> 3) & 0x1FFFU;
 
-    vehicle_moving = (fr | rr | rl | fl) != 0U;
+    safety.vehicle_moving = (fr | rr | rl | fl) != 0U;
 
     UPDATE_VEHICLE_SPEED((fr + rr + rl + fl) / 4.0 * 0.057 * KPH_TO_MS);
   }
 
   if (msg_matches(msg, MSG_SUBARU_Brake_Status, alt_main_bus)) {
-    brake_pressed = (msg->data[7] >> 6) & 1U;
+    safety.brake_pressed = (msg->data[7] >> 6) & 1U;
   }
 
   if (msg_matches(msg, MSG_SUBARU_Throttle, SUBARU_MAIN_BUS)) {
-    gas_pressed = msg->data[4] != 0U;
+    safety.gas_pressed = msg->data[4] != 0U;
   }
 }
 
@@ -149,7 +146,7 @@ static bool subaru_tx_hook(const CANPacket_t *msg) {
   bool violation = false;
 
   // Angle steer command checks
-  if (subaru_lkas_angle && (msg->addr == MSG_SUBARU_ES_LKAS_ANGLE)) {
+  if (safety_setup.subaru_lkas_angle && (msg->addr == MSG_SUBARU_ES_LKAS_ANGLE)) {
     const AngleSteeringLimits SUBARU_ANGLE_STEERING_LIMITS = {
       .max_angle = 190 * 100,
       .angle_deg_to_can = 100.,
@@ -167,15 +164,15 @@ static bool subaru_tx_hook(const CANPacket_t *msg) {
     desired_angle = -1 * to_signed(desired_angle, 17);
     bool steer_req = GET_BIT(msg, 12U);
 
-    if (controls_allowed && steer_req) {
+    if (safety.controls_allowed && steer_req) {
       // Match the controller's EPS/low-speed limits as well as the vehicle-model limits.
       const int max_angle_delta = (5 * 100) + 1;  // 5 deg/frame plus CAN quantization tolerance
       violation |= safety_max_limit_check(desired_angle, SUBARU_ANGLE_STEERING_LIMITS.max_angle, -SUBARU_ANGLE_STEERING_LIMITS.max_angle);
-      violation |= safety_max_limit_check(desired_angle, desired_angle_last + max_angle_delta, desired_angle_last - max_angle_delta);
+      violation |= safety_max_limit_check(desired_angle, safety.desired_angle_last + max_angle_delta, safety.desired_angle_last - max_angle_delta);
     }
     violation |= steer_angle_cmd_checks_vm(desired_angle, steer_req, SUBARU_ANGLE_STEERING_LIMITS, SUBARU_ANGLE_STEERING_PARAMS);
     if (violation) {
-      desired_angle_last = SAFETY_CLAMP(angle_meas.values[0], -SUBARU_ANGLE_STEERING_LIMITS.max_angle, SUBARU_ANGLE_STEERING_LIMITS.max_angle);
+      safety.desired_angle_last = SAFETY_CLAMP(safety.angle_meas.values[0], -SUBARU_ANGLE_STEERING_LIMITS.max_angle, SUBARU_ANGLE_STEERING_LIMITS.max_angle);
     }
   }
 
@@ -186,7 +183,7 @@ static bool subaru_tx_hook(const CANPacket_t *msg) {
 
     bool steer_req = (msg->data[3] >> 5) & 1U;
 
-    const TorqueSteeringLimits limits = subaru_gen2 ? SUBARU_GEN2_STEERING_LIMITS : SUBARU_STEERING_LIMITS;
+    const TorqueSteeringLimits limits = safety_setup.subaru_gen2 ? SUBARU_GEN2_STEERING_LIMITS : SUBARU_STEERING_LIMITS;
     violation |= steer_torque_cmd_checks(desired_torque, steer_req, limits);
   }
 
@@ -232,23 +229,23 @@ static safety_config subaru_init(uint16_t param) {
   const uint16_t SUBARU_PARAM_GEN2 = 1;
   const uint16_t SUBARU_PARAM_LKAS_ANGLE = 8;
 
-  subaru_gen2 = GET_FLAG(param, SUBARU_PARAM_GEN2);
-  subaru_lkas_angle = GET_FLAG(param, SUBARU_PARAM_LKAS_ANGLE);
+  safety_setup.subaru_gen2 = GET_FLAG(param, SUBARU_PARAM_GEN2);
+  safety_setup.subaru_lkas_angle = GET_FLAG(param, SUBARU_PARAM_LKAS_ANGLE);
 
   // TODO: re-enable once more work is done on the limits
   // revert this in the PR that re-enables Subaru longitudinal: https://github.com/commaai/opendbc/pull/3689
 
   safety_config ret;
-  if (subaru_lkas_angle) {
+  if (safety_setup.subaru_lkas_angle) {
     static const RxCheck subaru_lkas_angle_rx_checks[] = {
       SUBARU_LKAS_ANGLE_RX_CHECKS(SUBARU_MAIN_BUS)
     };
     static const RxCheck subaru_lkas_angle_gen2_rx_checks[] = {
       SUBARU_LKAS_ANGLE_RX_CHECKS(SUBARU_ALT_BUS)
     };
-    ret = subaru_gen2 ? BUILD_SAFETY_CFG(subaru_lkas_angle_gen2_rx_checks, SUBARU_LKAS_ANGLE_GEN2_TX_MSGS) : \
-                        BUILD_SAFETY_CFG(subaru_lkas_angle_rx_checks, SUBARU_LKAS_ANGLE_TX_MSGS);
-  } else if (subaru_gen2) {
+    ret = safety_setup.subaru_gen2 ? BUILD_SAFETY_CFG(subaru_lkas_angle_gen2_rx_checks, SUBARU_LKAS_ANGLE_GEN2_TX_MSGS) : \
+                                     BUILD_SAFETY_CFG(subaru_lkas_angle_rx_checks, SUBARU_LKAS_ANGLE_TX_MSGS);
+  } else if (safety_setup.subaru_gen2) {
     static const RxCheck subaru_gen2_rx_checks[] = {
       SUBARU_COMMON_RX_CHECKS(SUBARU_ALT_BUS)
     };
